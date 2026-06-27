@@ -4,7 +4,7 @@ open ireu.Scraper
 
 let inputCsv  = "nsf_reusites.csv"
 let outputCsv = "nsf_results.csv"
-let enableLlm = false
+let enableLLM = true
 
 let logResults (results: REU list) : REU list =
     let statusOf (r: REU) =
@@ -30,13 +30,14 @@ let printSummary (results: REU list) =
 [<EntryPoint>]
 let main _ =
     let entries = readCSV inputCsv
+    DotNetEnv.Env.Load() |> ignore
     printfn "Loaded %d REU entries from %s.\n" entries.Length inputCsv
 
     let results =
         entries
         |> scrapeAll                                        // 1. fetch page text
         |> Classifier.classifyAll                           // 2. try regex classification
-        |> LLMClassifier.classifyAll enableLlm    // 3. use LLM fallback only for Unclear ones
+        |> LLMClassifier.classifyAll enableLLM    // 3. use LLM fallback only for Unclear ones
         |> logResults
 
     writeCSV results outputCsv

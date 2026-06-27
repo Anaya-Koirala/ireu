@@ -6,7 +6,6 @@ open System.Text.RegularExpressions
 open ireu
 
 let normalizeText (s: string) =
-    // Single pass: replace unicode spaces then collapse whitespace
     let sb = Text.StringBuilder s.Length
     let mutable prevSpace = false
 
@@ -32,18 +31,16 @@ let normalizeText (s: string) =
 
 let rxOpts = RegexOptions.Singleline ||| RegexOptions.Compiled
 
-// Gang the entire regex patterns is generated through AI all through trial and error
-// This is the primary reason behind misclassification, mostly as Unclear, due to the variations in the ordering, verb and grammar
 let noPatterns =
     [
       // US citizens only.
-      @"(?:only|open\s+only\s+to|restricted\s+to)\s+(?:u\.?\s*s\.?|us|united\s+states).*?(?:citizens?|nationals?)"
+      @"(?:only|open\s+only\s+to|restricted\s+to)\s+(?:u\.?\s*s\.?|us|united\s+states)[^\n]{0,40}?(?:citizens?|nationals?)"
 
       // Applicants must be US citizens.
       @"(?:applicants?|students?|participants?)\s+must\s+be\s+(?:a\s+)?(?:u\.?\s*s\.?|us|united\s+states)\s+(?:citizens?|nationals?)"
 
       // Must be US citizen or permanent resident.
-      @"must\s+be\s+(?:a\s+)?(?:(?:permanent\s+resident)|(?:(?:u\.?\s*s\.?|us|united\s+states)\s+(?:citizen|national))).*?(?:or|and).*?(?:permanent\s+resident|(?:u\.?\s*s\.?|us|united\s+states)\s+(?:citizen|national))"
+      @"must\s+be\s+(?:a\s+)?(?:(?:permanent\s+resident)|(?:(?:u\.?\s*s\.?|us|united\s+states)\s+(?:citizen|national)))[^\n]{0,30}?(?:or|and)[^\n]{0,30}?(?:permanent\s+resident|(?:u\.?\s*s\.?|us|united\s+states)\s+(?:citizen|national))"
 
       // US citizenship required.
       @"(?:u\.?\s*s\.?|us|united\s+states)\s+citizenship(?:\s+or\s+permanent\s+residen\w+)?\s+is\s+required"
@@ -119,7 +116,7 @@ let yesPatterns =
       @"visa\s+status\s+does\s+not\s+affect\s+eligibility"
 
       // J-1 sponsorship offered.
-      @"(?:will\s+)?sponsor.*?j[\-\s]?1\s+visa"
+      @"(?:will\s+)?sponsor[^\n]{0,40}?j[\-\s]?1\s+visa"
 
       // J-1 support offered.
       @"j[\-\s]?1\s+visa\s+(?:paperwork|sponsorship|support)"
@@ -178,9 +175,12 @@ let classifyText (text: string) : Eligibility * string option =
 let classify (reu: REU) : REU =
     if reu.error.IsSome then reu
     else
-        match reu.pageText |> Option.map classifyText with
-        | None | Some (Unclear, _)   -> reu
-        | Some (elig, evidence)      -> { reu with eligibility = elig; evidence = evidence; source = FromRegex }
+        match reu.pageText with
+        | None -> reu
+        | Some text ->
+            match classifyText text with
+            | Unclear, _      -> { reu with eligibility = Unclear; source = Unclassified }
+            | elig, evidence  -> { reu with eligibility = elig; evidence = evidence; source = FromRegex }
 
 let classifyAll (reus: REU list) : REU list =
     reus |> List.map classify

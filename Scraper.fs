@@ -13,7 +13,10 @@ let private timeout_sec = 15.0
 let private sublink_count = 5
 let private semaphore_max_count = 20
 let private semaphore_initial_count = 10
-let private dev_email = Environment.GetEnvironmentVariable "DEV_EMAIL"
+let private dev_email =
+    Environment.GetEnvironmentVariable "DEV_EMAIL"
+    |> Option.ofObj
+    |> Option.defaultValue "unknown"
 
 let subpageKeywords =
     [
@@ -25,6 +28,7 @@ let subpageKeywords =
         "apply"
         "require"
         "who can"
+        "who should apply?"
         "qualif"
         "overview"
         "admission"
@@ -40,7 +44,7 @@ let httpClient =
     handler.PooledConnectionLifetime <- TimeSpan.FromMinutes pooled_conn_lifetime_min
 
     let c = new HttpClient(handler)
-    c.DefaultRequestHeaders.Add("User-Agent", "iREU-Scraper/1.0 (Find REUs eligible for international students);"+dev_email)
+    c.DefaultRequestHeaders.Add("User-Agent", $"iREU-Scraper/1.0 (Find REUs eligible for international students; %s{dev_email})")
     c.Timeout <- TimeSpan.FromSeconds timeout_sec
     c
 
@@ -60,15 +64,31 @@ let fetchHtml (url: string) : Async<string option> =
         | _ -> return None
     }
 
+/// Collect visible text from a node, skipping <script> and <style> subtrees.
+/// DirectInnerText keeps each node's own text; recursing the child elements
+/// rebuilds the full text without script/style content. Anchors are read
+/// separately from the raw parse, so this never affects link discovery.
+let rec private gatherText (n: HtmlNode) : string =
+    match n.Name().ToLowerInvariant() with
+    | "script" | "style" -> ""
+    | _ ->
+        let own  = n.DirectInnerText()
+        let kids = n.Elements() |> List.map gatherText |> String.concat " "
+        own + " " + kids
+
 /// Extract body text and relevant subpage links in a single DOM pass.
 let parseHtml (baseUrl: string) (html: string) : string * string list =
-    let doc  = try HtmlDocument.Parse html with _ -> HtmlDocument.Parse "<html></html>"
+    let doc  =
+        try HtmlDocument.Parse html
+        with ex ->
+            eprintfn "    [parse failed] %s — %s" baseUrl ex.Message
+            HtmlDocument.Parse "<html></html>"
     let baseUri = Uri baseUrl
 
     let text =
         doc.Descendants "body"
         |> Seq.tryHead
-        |> Option.map (fun b -> b.InnerText())
+        |> Option.map gatherText
         |> Option.defaultValue ""
 
     let basePath = baseUri.AbsolutePath.TrimEnd '/'
@@ -130,40 +150,51 @@ let parseHtml (baseUrl: string) (html: string) : string * string list =
 //
 //  Early exit means most entries need only 1-2 HTTP requests, and we
 //  never hold more than one DOM tree per REU in memory at a time.
-let scrape (reu: REU) : Async<REU> =
+let scrape (reu: REU) : Async<REU * int> =
     async {
         match! fetchHtml reu.website with
         | None ->
-            return { reu with error = Some(sprintf "Failed to fetch %s" reu.website) }
+            return { reu with error = Some(sprintf "Failed to fetch %s" reu.website) }, 0
         | Some html ->
-            let mainText, subpageUrls = parseHtml reu.website html
+            let mainText, rawSubpageUrls = parseHtml reu.website html
+
+            // Drop links that point back to the main page itself — fetching it
+            // again wastes a request and never changes the verdict.
+            let baseNorm = (Uri reu.website).AbsoluteUri.TrimEnd '/'
+            let subpageUrls =
+                rawSubpageUrls
+                |> List.filter (fun u -> (Uri u).AbsoluteUri.TrimEnd '/' <> baseNorm)
 
             let isConfident text =
                 match classifyText text with
                 | (Yes | No), _ -> true
                 | Unclear, _    -> false
 
-            let rec walk urls (acc: string list) =
+            let rec walk urls (acc: string list) (fetched: int) =
                 async {
                     match urls with
-                    | [] -> return acc
+                    | [] -> return acc, fetched
                     | url :: rest ->
                         match! fetchHtml url with
-                        | None -> return! walk rest acc
+                        | None -> return! walk rest acc (fetched + 1)
                         | Some subHtml ->
                             let subText, _ = parseHtml url subHtml
                             let acc' = subText :: acc
                             if isConfident subText
-                            then return acc'
-                            else return! walk rest acc'
+                            then return acc', (fetched + 1)
+                            else return! walk rest acc' (fetched + 1)
                 }
 
             if isConfident mainText then
-                return { reu with pageText = Some mainText }
+                return { reu with pageText = Some mainText }, 0
             else
-                let! collected = walk subpageUrls [ mainText ]
+                let! collected, fetched = walk subpageUrls [ mainText ] 0
+                // Surface found-vs-visited so a silent parse failure (0 found)
+                // is distinguishable from subpages that simply weren't decisive.
+                printfn "    %s: %d subpage link(s) found, %d visited"
+                    reu.title subpageUrls.Length fetched
                 let combined = collected |> List.rev |> String.concat "\n\n"
-                return { reu with pageText = Some combined }
+                return { reu with pageText = Some combined }, fetched
     }
 
 let scrapeAll (entries: REU list) : REU list =
@@ -173,13 +204,14 @@ let scrapeAll (entries: REU list) : REU list =
         async {
             do! semaphore.WaitAsync() |> Async.AwaitTask
             try
-                let! result = scrape reu
+                let! result, subpagesVisited = scrape reu
+                printfn "  (%d subpage(s)) %s" subpagesVisited reu.title
                 return result
             finally
                 semaphore.Release() |> ignore
         }
 
-    printfn "Scraping %d REU sites (concurrency=%d, early exit)...\n" entries.Length semaphore_max_count
+    printfn "Scraping %d REU sites (concurrency=%d, max subpages=%d, early exit)...\n" entries.Length semaphore_max_count sublink_count
 
     entries
     |> List.map throttled
